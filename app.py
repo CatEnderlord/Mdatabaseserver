@@ -1,0 +1,845 @@
+from flask import Flask, request, jsonify, render_template_string
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import io
+import base64
+from datetime import datetime
+import pyodbc
+import threading
+import json
+import os
+import logging
+import traceback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Azure SQL Database configuration
+DB_SERVER = os.environ.get('DB_SERVER', 'azureserverdatabase.database.windows.net')
+DB_NAME = os.environ.get('DB_NAME', 'databasesqlserver')
+DB_USER = os.environ.get('DB_USER', 'databaseadmin')
+DB_PASSWORD = os.environ.get('DB_PASSWORD', 'Enderlord0525')
+
+CONNECTION_STRING = (
+    f'DRIVER={{ODBC Driver 18 for SQL Server}};'
+    f'SERVER={DB_SERVER};'
+    f'DATABASE={DB_NAME};'
+    f'UID={DB_USER};'
+    f'PWD={DB_PASSWORD};'
+    f'Encrypt=yes;'
+    f'TrustServerCertificate=no;'
+    f'Connection Timeout=30;'
+)
+
+max_entries = 100
+db_lock = threading.Lock()
+
+# HTML template with embedded table and charts
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>System Metrics Dashboard</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .api-info {
+            background-color: #f0f9ff;
+            border: 2px solid #0ea5e9;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        .api-info h2 {
+            margin-top: 0;
+            color: #0369a1;
+        }
+        .api-info code {
+            background-color: #e0f2fe;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+        .api-info pre {
+            background-color: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-card h3 {
+            margin: 0 0 10px 0;
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: bold;
+            margin: 0;
+        }
+        .client-section {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #fafafa;
+            border-radius: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th {
+            background-color: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .status-connected {
+            color: #22c55e;
+            font-weight: bold;
+        }
+        .status-disconnected {
+            color: #ef4444;
+            font-weight: bold;
+        }
+        .charts {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+        }
+        .chart-container {
+            text-align: center;
+        }
+        .chart-container img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .info {
+            text-align: center;
+            color: #666;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        .no-data {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+        .no-data h2 {
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>System Metrics Dashboard</h1>
+        
+        <div class="api-info">
+            <h2>How to Send Metrics</h2>
+            <p>Send metrics to this dashboard via POST request:</p>
+            <p><strong>Endpoint:</strong> <code>POST {{ base_url }}/api/metrics</code></p>
+            <p><strong>Example Python Code:</strong></p>
+            <pre>import requests
+import psutil
+from datetime import datetime
+def send_metrics():
+    metrics = {
+        'timestamp': datetime.now().isoformat(),
+        'cpu_percent': psutil.cpu_percent(interval=1),
+        'ram': {
+            'used_gb': psutil.virtual_memory().used / (1024**3),
+            'total_gb': psutil.virtual_memory().total / (1024**3),
+            'percent': psutil.virtual_memory().percent
+        },
+        'client_name': 'My Computer'  # Optional identifier
+    }
+    
+    response = requests.post(
+        '{{ base_url }}/api/metrics',
+        json=metrics
+    )
+    print(response.json())
+# Run every 5 seconds
+import time
+while True:
+    send_metrics()
+    time.sleep(5)</pre>
+        </div>
+        {% if metrics %}
+        {% if latest_metrics %}
+        <div class="stats">
+            <div class="stat-card">
+                <h3>Active Clients</h3>
+                <p class="value">{{ total_clients }}</p>
+            </div>
+            <div class="stat-card">
+                <h3>Total Metrics</h3>
+                <p class="value">{{ total_metrics }}</p>
+            </div>
+            <div class="stat-card">
+                <h3>Latest CPU</h3>
+                <p class="value">{{ "%.1f"|format(latest_metrics.cpu_percent) if latest_metrics.cpu_percent else "N/A" }}%</p>
+            </div>
+            <div class="stat-card">
+                <h3>Latest RAM</h3>
+                <p class="value">{{ "%.1f"|format(latest_metrics.ram.percent) if latest_metrics.ram else "N/A" }}%</p>
+            </div>
+        </div>
+        {% endif %}
+        <h2>Recent Metrics from All Clients</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Client</th>
+                    <th>Timestamp</th>
+                    <th>CPU %</th>
+                    <th>GPU %</th>
+                    <th>RAM Used (GB)</th>
+                    <th>RAM %</th>
+                    <th>Ping (ms)</th>
+                    <th>Internet</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for metric in metrics %}
+                <tr>
+                    <td><strong>{{ metric.client_name or metric.client_id }}</strong></td>
+                    <td>{{ metric.timestamp }}</td>
+                    <td>{{ "%.1f"|format(metric.cpu_percent) if metric.cpu_percent else "N/A" }}%</td>
+                    <td>{{ "%.1f"|format(metric.gpu_percent) if metric.gpu_percent else "N/A" }}</td>
+                    <td>
+                        {% if metric.ram %}
+                        {{ "%.2f"|format(metric.ram.used_gb) }} / {{ "%.2f"|format(metric.ram.total_gb) }}
+                        {% else %}
+                        N/A
+                        {% endif %}
+                    </td>
+                    <td>{{ "%.1f"|format(metric.ram.percent) if metric.ram else "N/A" }}%</td>
+                    <td>{{ "%.1f"|format(metric.ping_ms) if metric.ping_ms else "N/A" }}</td>
+                    <td class="{% if metric.internet_connected %}status-connected{% else %}status-disconnected{% endif %}">
+                        {% if metric.internet_connected is not none %}
+                            {{ "Connected" if metric.internet_connected else "Disconnected" }}
+                        {% else %}
+                            N/A
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% if charts %}
+        <h2>Performance Charts</h2>
+        <div class="charts">
+            {% for chart_name, chart_data in charts.items() %}
+            <div class="chart-container">
+                <h3>{{ chart_name }}</h3>
+                <img src="data:image/png;base64,{{ chart_data }}" alt="{{ chart_name }}">
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <div class="info">
+            <p>Dashboard auto-refreshes every 5 seconds | Total clients: {{ total_clients }}</p>
+        </div>
+        {% else %}
+        <div class="no-data">
+            <h2>No Metrics Yet</h2>
+            <p>Waiting for clients to send data...</p>
+            <p>Use the API endpoint above to start sending metrics.</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+'''
+
+# ==================== DATABASE FUNCTIONS ====================
+def get_db_connection():
+    """Get a database connection to Azure SQL."""
+    try:
+        logger.info("Attempting database connection...")
+        conn = pyodbc.connect(CONNECTION_STRING)
+        logger.info("✓ Database connection successful")
+        return conn
+    except Exception as e:
+        logger.error(f"✗ Database connection failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def init_db():
+    """Initialize the Azure SQL database tables."""
+    try:
+        logger.info("Starting database initialization...")
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            logger.info("Creating metrics table if not exists...")
+            cursor.execute('''
+                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='metrics' AND xtype='U')
+                CREATE TABLE metrics (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    client_id NVARCHAR(255) NOT NULL,
+                    client_name NVARCHAR(255),
+                    timestamp NVARCHAR(50) NOT NULL,
+                    received_at NVARCHAR(50) NOT NULL,
+                    cpu_percent FLOAT,
+                    gpu_percent FLOAT,
+                    ram_json NVARCHAR(MAX),
+                    ping_ms FLOAT,
+                    internet_connected BIT,
+                    raw_data NVARCHAR(MAX),
+                    created_at DATETIME2 DEFAULT GETDATE()
+                )
+            ''')
+            logger.info("✓ Metrics table created/verified")
+            
+            logger.info("Creating index on client_id...")
+            cursor.execute('''
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_client_id' AND object_id = OBJECT_ID('metrics'))
+                CREATE INDEX idx_client_id ON metrics(client_id)
+            ''')
+            logger.info("✓ Index idx_client_id created/verified")
+            
+            logger.info("Creating index on timestamp...")
+            cursor.execute('''
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_timestamp' AND object_id = OBJECT_ID('metrics'))
+                CREATE INDEX idx_timestamp ON metrics(timestamp DESC)
+            ''')
+            logger.info("✓ Index idx_timestamp created/verified")
+            
+            conn.commit()
+            conn.close()
+            logger.info("✓ Database initialization complete")
+    except Exception as e:
+        logger.error(f"✗ Database initialization failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def cleanup_old_metrics(client_id):
+    """Keep only the latest max_entries for each client."""
+    try:
+        logger.info(f"Starting cleanup for client: {client_id}")
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
+            count = cursor.fetchone()[0]
+            logger.info(f"Client {client_id} has {count} entries")
+            
+            if count > max_entries:
+                logger.info(f"Cleaning up old entries (keeping {max_entries})...")
+                cursor.execute('''
+                    WITH ToDelete AS (
+                        SELECT id
+                        FROM metrics
+                        WHERE client_id = ?
+                        ORDER BY timestamp DESC
+                        OFFSET ? ROWS
+                    )
+                    DELETE FROM metrics WHERE id IN (SELECT id FROM ToDelete)
+                ''', (client_id, max_entries))
+                deleted = cursor.rowcount
+                conn.commit()
+                logger.info(f"✓ Deleted {deleted} old entries for client {client_id}")
+            else:
+                logger.info(f"✓ No cleanup needed for client {client_id}")
+            
+            conn.close()
+    except Exception as e:
+        logger.error(f"✗ Cleanup failed for client {client_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def insert_metric(client_id, data):
+    """Insert a metric into the database."""
+    try:
+        logger.info(f"Inserting metric for client: {client_id}")
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Extract fields
+            client_name = data.get('client_name')
+            timestamp = data.get('timestamp')
+            received_at = data.get('received_at')
+            cpu_percent = data.get('cpu_percent')
+            gpu_percent = data.get('gpu_percent')
+            ram = data.get('ram')
+            ping_ms = data.get('ping_ms')
+            internet_connected = data.get('internet_connected')
+            
+            ram_json = json.dumps(ram) if ram else None
+            raw_data = json.dumps(data)
+            
+            logger.info(f"Data - CPU: {cpu_percent}%, RAM: {ram.get('percent') if ram else 'N/A'}%")
+            
+            cursor.execute('''
+                INSERT INTO metrics 
+                (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent, 
+                 ram_json, ping_ms, internet_connected, raw_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent,
+                  ram_json, ping_ms, internet_connected, raw_data))
+            
+            conn.commit()
+            
+            cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
+            count = cursor.fetchone()[0]
+            
+            conn.close()
+            logger.info(f"✓ Metric inserted successfully. Total for client: {count}")
+            
+            cleanup_old_metrics(client_id)
+            
+            return count
+    except Exception as e:
+        logger.error(f"✗ Insert metric failed for client {client_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def get_all_metrics(limit=50):
+    """Get all metrics from database."""
+    try:
+        logger.info(f"Fetching all metrics (limit: {limit})...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT TOP (?) * FROM metrics 
+            ORDER BY timestamp DESC
+        ''', (limit,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        metrics = []
+        for row in rows:
+            metric = json.loads(row.raw_data)
+            metric['client_id'] = row.client_id
+            metrics.append(metric)
+        
+        logger.info(f"✓ Retrieved {len(metrics)} metrics")
+        return metrics
+    except Exception as e:
+        logger.error(f"✗ Get all metrics failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+
+def get_client_metrics(client_id=None, limit=20):
+    """Get metrics for a specific client or all clients."""
+    try:
+        logger.info(f"Fetching metrics for client: {client_id or 'all'} (limit: {limit})")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if client_id:
+            cursor.execute('''
+                SELECT TOP (?) * FROM metrics 
+                WHERE client_id = ?
+                ORDER BY timestamp DESC
+            ''', (limit, client_id))
+        else:
+            cursor.execute('''
+                SELECT TOP (?) * FROM metrics 
+                ORDER BY timestamp DESC
+            ''', (limit,))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        metrics = []
+        for row in rows:
+            metric = json.loads(row.raw_data)
+            metric['client_id'] = row.client_id
+            metrics.append(metric)
+        
+        logger.info(f"✓ Retrieved {len(metrics)} client metrics")
+        return metrics
+    except Exception as e:
+        logger.error(f"✗ Get client metrics failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+
+def get_total_clients():
+    """Get count of unique clients."""
+    try:
+        logger.info("Counting total clients...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(DISTINCT client_id) as count FROM metrics')
+        count = cursor.fetchone()[0]
+        
+        conn.close()
+        logger.info(f"✓ Total clients: {count}")
+        return count
+    except Exception as e:
+        logger.error(f"✗ Get total clients failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return 0
+
+def get_total_metrics():
+    """Get total count of metrics."""
+    try:
+        logger.info("Counting total metrics...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) as count FROM metrics')
+        count = cursor.fetchone()[0]
+        
+        conn.close()
+        logger.info(f"✓ Total metrics: {count}")
+        return count
+    except Exception as e:
+        logger.error(f"✗ Get total metrics failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return 0
+
+def get_client_list():
+    """Get list of all clients with their info."""
+    try:
+        logger.info("Fetching client list...")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT 
+                client_id,
+                client_name,
+                MAX(timestamp) as last_seen,
+                COUNT(*) as metric_count
+            FROM metrics
+            GROUP BY client_id, client_name
+        ''')
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        clients = []
+        for row in rows:
+            clients.append({
+                'client_id': row.client_id,
+                'client_name': row.client_name or row.client_id,
+                'last_seen': row.last_seen,
+                'metric_count': row.metric_count
+            })
+        
+        logger.info(f"✓ Retrieved {len(clients)} clients")
+        return clients
+    except Exception as e:
+        logger.error(f"✗ Get client list failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+
+# ==================== HELPER FUNCTIONS ====================
+def generate_charts(metrics_list):
+    """Generate matplotlib charts from metrics data."""
+    try:
+        logger.info(f"Generating charts from {len(metrics_list)} metrics...")
+        
+        if not metrics_list or len(metrics_list) < 2:
+            logger.info("✓ Not enough data for charts (need at least 2 points)")
+            return {}
+        
+        charts = {}
+        
+        timestamps = [m.get('timestamp', '')[-8:] for m in metrics_list]
+        cpu_data = [m.get('cpu_percent', 0) for m in metrics_list if m.get('cpu_percent') is not None]
+        ram_data = [m.get('ram', {}).get('percent', 0) for m in metrics_list if m.get('ram', {}).get('percent') is not None]
+        
+        # CPU Chart
+        if cpu_data and len(cpu_data) > 1:
+            logger.info("Generating CPU chart...")
+            cpu_timestamps = [m.get('timestamp', '')[-8:] for m in metrics_list if m.get('cpu_percent') is not None]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(cpu_timestamps, cpu_data, marker='o', linewidth=2, markersize=4, color='#667eea')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('CPU Usage (%)')
+            ax.set_title('CPU Usage Over Time')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 100)
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            charts['CPU Usage'] = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+            logger.info("✓ CPU chart generated")
+        
+        # RAM Chart
+        if ram_data and len(ram_data) > 1:
+            logger.info("Generating RAM chart...")
+            ram_timestamps = [m.get('timestamp', '')[-8:] for m in metrics_list if m.get('ram', {}).get('percent') is not None]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(ram_timestamps, ram_data, marker='o', linewidth=2, markersize=4, color='#764ba2')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('RAM Usage (%)')
+            ax.set_title('RAM Usage Over Time')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 100)
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            charts['RAM Usage'] = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+            logger.info("✓ RAM chart generated")
+        
+        # GPU Chart
+        gpu_data = [m.get('gpu_percent') for m in metrics_list if m.get('gpu_percent') is not None]
+        if gpu_data and len(gpu_data) > 1:
+            logger.info("Generating GPU chart...")
+            gpu_timestamps = [m.get('timestamp', '')[-8:] for m in metrics_list if m.get('gpu_percent') is not None]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(gpu_timestamps, gpu_data, marker='o', linewidth=2, markersize=4, color='#22c55e')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('GPU Usage (%)')
+            ax.set_title('GPU Usage Over Time')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 100)
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            charts['GPU Usage'] = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+            logger.info("✓ GPU chart generated")
+        
+        # Ping Chart
+        ping_data = [m.get('ping_ms') for m in metrics_list if m.get('ping_ms') is not None]
+        if ping_data and len(ping_data) > 1:
+            logger.info("Generating Ping chart...")
+            ping_timestamps = [m.get('timestamp', '')[-8:] for m in metrics_list if m.get('ping_ms') is not None]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(ping_timestamps, ping_data, marker='o', linewidth=2, markersize=4, color='#f59e0b')
+            ax.set_xlabel('Time')
+            ax.set_ylabel('Ping (ms)')
+            ax.set_title('Network Latency Over Time')
+            ax.grid(True, alpha=0.3)
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            charts['Network Latency'] = base64.b64encode(buf.read()).decode('utf-8')
+            plt.close()
+            logger.info("✓ Ping chart generated")
+        
+        logger.info(f"✓ Generated {len(charts)} charts total")
+        return charts
+    except Exception as e:
+        logger.error(f"✗ Chart generation failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {}
+
+# ==================== FLASK ROUTES ====================
+@app.route('/')
+def dashboard():
+    """Display the metrics dashboard."""
+    try:
+        logger.info("Dashboard route accessed")
+        
+        all_metrics = get_all_metrics(limit=50)
+        latest = all_metrics[0] if all_metrics else None
+        recent_metrics = list(reversed(get_client_metrics(limit=20)))
+        charts = generate_charts(recent_metrics)
+        total_clients = get_total_clients()
+        total_metrics = get_total_metrics()
+        base_url = request.url_root.rstrip('/')
+        
+        logger.info("✓ Dashboard rendered successfully")
+        
+        return render_template_string(
+            HTML_TEMPLATE,
+            metrics=all_metrics,
+            latest_metrics=latest,
+            charts=charts,
+            total_clients=total_clients,
+            total_metrics=total_metrics,
+            base_url=base_url
+        )
+    except Exception as e:
+        logger.error(f"✗ Dashboard route failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return f"Dashboard Error: {str(e)}", 500
+
+@app.route('/api/metrics', methods=['POST'])
+def receive_metrics():
+    """API endpoint to receive metrics from external monitoring clients."""
+    try:
+        logger.info(f"POST /api/metrics from {request.remote_addr}")
+        
+        data = request.get_json()
+        
+        if not data:
+            logger.warning("✗ No data provided in request")
+            return jsonify({'error': 'No data provided'}), 400
+        
+        data['received_at'] = datetime.now().isoformat()
+        client_id = data.get('client_name') or data.get('client_id') or request.remote_addr
+        
+        logger.info(f"Processing metrics from client: {client_id}")
+        
+        count = insert_metric(client_id, data)
+        
+        logger.info(f"✓ Metrics received successfully from {client_id}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Metrics received',
+            'client_id': client_id,
+            'stored_count': count
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"✗ Receive metrics failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/metrics', methods=['GET'])
+def get_metrics():
+    """API endpoint to retrieve stored metrics."""
+    try:
+        logger.info("GET /api/metrics")
+        
+        all_metrics = get_all_metrics(limit=1000)
+        total_clients = get_total_clients()
+        
+        logger.info("✓ Metrics retrieved successfully")
+        
+        return jsonify({
+            'total_entries': len(all_metrics),
+            'total_clients': total_clients,
+            'metrics': all_metrics
+        }), 200
+    except Exception as e:
+        logger.error(f"✗ Get metrics API failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clients', methods=['GET'])
+def get_clients():
+    """API endpoint to get list of connected clients."""
+    try:
+        logger.info("GET /api/clients")
+        
+        clients = get_client_list()
+        
+        logger.info("✓ Client list retrieved successfully")
+        
+        return jsonify({
+            'total_clients': len(clients),
+            'clients': clients
+        }), 200
+    except Exception as e:
+        logger.error(f"✗ Get clients API failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health')
+def health():
+    """Health check endpoint for Azure."""
+    try:
+        logger.info("Health check accessed")
+        
+        total_clients = get_total_clients()
+        
+        logger.info("✓ Health check passed")
+        
+        return jsonify({
+            'status': 'healthy',
+            'clients': total_clients,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"✗ Health check failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+# ==================== MAIN ====================
+if __name__ == '__main__':
+    try:
+        logger.info("="*60)
+        logger.info("STARTING FLASK APPLICATION")
+        logger.info("="*60)
+        logger.info(f"Database Server: {DB_SERVER}")
+        logger.info(f"Database Name: {DB_NAME}")
+        logger.info(f"Database User: {DB_USER}")
+        
+        # Initialize database
+        init_db()
+        
+        logger.info("Starting Flask server on 0.0.0.0:8000")
+        # For local development
+        port = int(os.environ.get('PORT', 8000))
+        app.run(host='0.0.0.0', port=port, debug=False)
+    except Exception as e:
+        logger.critical(f"✗✗✗ APPLICATION STARTUP FAILED ✗✗✗")
+        logger.critical(f"Error: {str(e)}")
+        logger.critical(traceback.format_exc())
+        raise
