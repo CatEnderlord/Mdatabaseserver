@@ -6,7 +6,6 @@ import io
 import base64
 from datetime import datetime
 import pyodbc
-import threading
 import json
 import os
 import logging
@@ -43,7 +42,6 @@ CONNECTION_STRING = (
 )
 
 max_entries = 100
-db_lock = threading.Lock()
 
 # HTML template with embedded table and charts
 HTML_TEMPLATE = '''
@@ -321,85 +319,48 @@ def init_db():
     """Initialize the Azure SQL database tables."""
     try:
         logger.info("Starting database initialization...")
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            logger.info("Creating metrics table if not exists...")
-            cursor.execute('''
-                IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='metrics' AND xtype='U')
-                CREATE TABLE metrics (
-                    id INT IDENTITY(1,1) PRIMARY KEY,
-                    client_id NVARCHAR(255) NOT NULL,
-                    client_name NVARCHAR(255),
-                    timestamp NVARCHAR(50) NOT NULL,
-                    received_at NVARCHAR(50) NOT NULL,
-                    cpu_percent FLOAT,
-                    gpu_percent FLOAT,
-                    ram_json NVARCHAR(MAX),
-                    ping_ms FLOAT,
-                    internet_connected BIT,
-                    raw_data NVARCHAR(MAX),
-                    created_at DATETIME2 DEFAULT GETDATE()
-                )
-            ''')
-            logger.info("✓ Metrics table created/verified")
-            
-            logger.info("Creating index on client_id...")
-            cursor.execute('''
-                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_client_id' AND object_id = OBJECT_ID('metrics'))
-                CREATE INDEX idx_client_id ON metrics(client_id)
-            ''')
-            logger.info("✓ Index idx_client_id created/verified")
-            
-            logger.info("Creating index on timestamp...")
-            cursor.execute('''
-                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_timestamp' AND object_id = OBJECT_ID('metrics'))
-                CREATE INDEX idx_timestamp ON metrics(timestamp DESC)
-            ''')
-            logger.info("✓ Index idx_timestamp created/verified")
-            
-            conn.commit()
-            conn.close()
-            logger.info("✓ Database initialization complete")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        logger.info("Creating metrics table if not exists...")
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='metrics' AND xtype='U')
+            CREATE TABLE metrics (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                client_id NVARCHAR(255) NOT NULL,
+                client_name NVARCHAR(255),
+                timestamp NVARCHAR(50) NOT NULL,
+                received_at NVARCHAR(50) NOT NULL,
+                cpu_percent FLOAT,
+                gpu_percent FLOAT,
+                ram_json NVARCHAR(MAX),
+                ping_ms FLOAT,
+                internet_connected BIT,
+                raw_data NVARCHAR(MAX),
+                created_at DATETIME2 DEFAULT GETDATE()
+            )
+        ''')
+        logger.info("✓ Metrics table created/verified")
+        
+        logger.info("Creating index on client_id...")
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_client_id' AND object_id = OBJECT_ID('metrics'))
+            CREATE INDEX idx_client_id ON metrics(client_id)
+        ''')
+        logger.info("✓ Index idx_client_id created/verified")
+        
+        logger.info("Creating index on timestamp...")
+        cursor.execute('''
+            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_timestamp' AND object_id = OBJECT_ID('metrics'))
+            CREATE INDEX idx_timestamp ON metrics(timestamp DESC)
+        ''')
+        logger.info("✓ Index idx_timestamp created/verified")
+        
+        conn.commit()
+        conn.close()
+        logger.info("✓ Database initialization complete")
     except Exception as e:
         logger.error(f"✗ Database initialization failed: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise
-
-def cleanup_old_metrics(client_id):
-    """Keep only the latest max_entries for each client."""
-    try:
-        logger.info(f"Starting cleanup for client: {client_id}")
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
-            count = cursor.fetchone()[0]
-            logger.info(f"Client {client_id} has {count} entries")
-            
-            if count > max_entries:
-                logger.info(f"Cleaning up old entries (keeping {max_entries})...")
-                cursor.execute('''
-                    WITH ToDelete AS (
-                        SELECT id
-                        FROM metrics
-                        WHERE client_id = ?
-                        ORDER BY timestamp DESC
-                        OFFSET ? ROWS
-                    )
-                    DELETE FROM metrics WHERE id IN (SELECT id FROM ToDelete)
-                ''', (client_id, max_entries))
-                deleted = cursor.rowcount
-                conn.commit()
-                logger.info(f"✓ Deleted {deleted} old entries for client {client_id}")
-            else:
-                logger.info(f"✓ No cleanup needed for client {client_id}")
-            
-            conn.close()
-    except Exception as e:
-        logger.error(f"✗ Cleanup failed for client {client_id}: {str(e)}")
         logger.error(traceback.format_exc())
         raise
 
@@ -407,44 +368,34 @@ def insert_metric(client_id, data):
     """Insert a metric into the database."""
     try:
         logger.info(f"Inserting metric for client: {client_id}")
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Extract fields
-            client_name = data.get('client_name')
-            timestamp = data.get('timestamp')
-            received_at = data.get('received_at')
-            cpu_percent = data.get('cpu_percent')
-            gpu_percent = data.get('gpu_percent')
-            ram = data.get('ram')
-            ping_ms = data.get('ping_ms')
-            internet_connected = data.get('internet_connected')
-            
-            ram_json = json.dumps(ram) if ram else None
-            raw_data = json.dumps(data)
-            
-            logger.info(f"Data - CPU: {cpu_percent}%, RAM: {ram.get('percent') if ram else 'N/A'}%")
-            
-            cursor.execute('''
-                INSERT INTO metrics 
-                (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent, 
-                 ram_json, ping_ms, internet_connected, raw_data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent,
-                  ram_json, ping_ms, internet_connected, raw_data))
-            
-            conn.commit()
-            
-            cursor.execute('SELECT COUNT(*) as count FROM metrics WHERE client_id = ?', (client_id,))
-            count = cursor.fetchone()[0]
-            
-            conn.close()
-            logger.info(f"✓ Metric inserted successfully. Total for client: {count}")
-            
-            cleanup_old_metrics(client_id)
-            
-            return count
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Extract fields
+        client_name = data.get('client_name')
+        timestamp = data.get('timestamp')
+        received_at = data.get('received_at')
+        cpu_percent = data.get('cpu_percent')
+        gpu_percent = data.get('gpu_percent')
+        ram = data.get('ram')
+        ping_ms = data.get('ping_ms')
+        internet_connected = data.get('internet_connected')
+        
+        ram_json = json.dumps(ram) if ram else None
+        raw_data = json.dumps(data)
+        
+        logger.info(f"Data - CPU: {cpu_percent}%, RAM: {ram.get('percent') if ram else 'N/A'}%")
+        
+        cursor.execute('''
+            INSERT INTO metrics 
+            (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent, 
+                ram_json, ping_ms, internet_connected, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (client_id, client_name, timestamp, received_at, cpu_percent, gpu_percent,
+                ram_json, ping_ms, internet_connected, raw_data))
+        
+        conn.commit()
+        conn.close()
     except Exception as e:
         logger.error(f"✗ Insert metric failed for client {client_id}: {str(e)}")
         logger.error(traceback.format_exc())
@@ -741,15 +692,14 @@ def receive_metrics():
         
         logger.info(f"Processing metrics from client: {client_id}")
         
-        count = insert_metric(client_id, data)
+        insert_metric(client_id, data)
         
         logger.info(f"✓ Metrics received successfully from {client_id}")
         
         return jsonify({
             'status': 'success',
             'message': 'Metrics received',
-            'client_id': client_id,
-            'stored_count': count
+            'client_id': client_id
         }), 200
         
     except Exception as e:
