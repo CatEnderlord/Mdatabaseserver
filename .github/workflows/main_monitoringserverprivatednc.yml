@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'monitoringserverprivatednc'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_5E50555BF27F4E9097871CDAB1064599 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_F82186F36F334FB5A851DBBF49C809A4 }}
